@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import threading
 import time
 from threading import Thread
 
@@ -29,9 +28,10 @@ accounts_store = {
 #   "texts": ["متن 1", "متن 2"],
 #   "text_index": 0,
 #   "speed": 0.5,
+#   "max_count": 0,      # 0 = نامحدود
 #   "running": True,
 #   "sent_count": 0,
-#   "last_status": "در حال ارسال..."
+#   "last_status": "در صف ارسال"
 # }
 spam_jobs = []
 spam_counter = 0
@@ -135,9 +135,37 @@ def _parse_multi_texts(raw_texts_encoded: str) -> list:
 load_accounts()
 
 
+# ================= بستن تمیز کلاینت و نشست‌ها =================
+async def _safe_close_client(c):
+    if c is None:
+        return
+    for attr in ("_client", "client", "_session_http", "http_session"):
+        sub = getattr(c, attr, None)
+        if sub is not None and hasattr(sub, "close"):
+            try:
+                res = sub.close()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
+    if hasattr(c, "disconnect"):
+        try:
+            res = c.disconnect()
+            if asyncio.iscoroutine(res):
+                await res
+        except Exception:
+            pass
+
+
 # ================= احراز هویت و مدیریت حساب =================
 async def _ensure_connected():
     try:
+        if hasattr(client, "is_connected") and callable(client.is_connected):
+            conn = client.is_connected()
+            if asyncio.iscoroutine(conn):
+                conn = await conn
+            if conn:
+                return
         await client.connect()
     except Exception as e:
         print(f"[WARN connect] {e}")
@@ -178,6 +206,9 @@ async def _submit_code_coro(code: str):
                 await client.sign_in(pending_phone, code)
 
         saved_session = client.session.save() if getattr(client, "session", None) else ""
+        if not saved_session:
+            raise RuntimeError("سشن خالی برگشت؛ دوباره تلاش کنید.")
+
         me_name = pending_phone
         try:
             me = await client.get_me()
@@ -192,7 +223,7 @@ async def _submit_code_coro(code: str):
                 "id": acc_id,
                 "phone": pending_phone,
                 "name": me_name,
-                "session": saved_session or "",
+                "session": saved_session,
             }
         )
         accounts_store["active_id"] = acc_id
@@ -218,11 +249,7 @@ async def _switch_account_coro(acc_id: str):
     save_accounts()
     group_list = []
 
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
-
+    await _safe_close_client(client)
     client = SoroushClient(StringSession(target_acc.get("session", "")))
     switch_requested = True
     data["auth_status"] = "disconnected"
@@ -230,22 +257,37 @@ async def _switch_account_coro(acc_id: str):
 
 
 async def _delete_account_coro(acc_id: str):
-    global client, switch_requested
+    global client, switch_requested, group_list
     accounts_store["accounts"] = [a for a in accounts_store["accounts"] if a["id"] != acc_id]
     if accounts_store.get("active_id") == acc_id:
         accounts_store["active_id"] = (
             accounts_store["accounts"][0]["id"] if accounts_store["accounts"] else None
         )
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        group_list = []
+        await _safe_close_client(client)
         next_acc = get_active_account()
         client = SoroushClient(StringSession(next_acc.get("session", "") if next_acc else ""))
         switch_requested = True
         data["auth_status"] = "disconnected"
     save_accounts()
     data["auth_message"] = "حساب حذف شد."
+
+
+async def _clear_all_accounts_coro():
+    global client, switch_requested, group_list, accounts_store
+    accounts_store = {"active_id": None, "accounts": []}
+    save_accounts()
+    if os.path.exists(LEGACY_SESSION_FILE):
+        try:
+            os.remove(LEGACY_SESSION_FILE)
+        except Exception:
+            pass
+    group_list = []
+    await _safe_close_client(client)
+    client = SoroushClient(StringSession())
+    switch_requested = True
+    data["auth_status"] = "disconnected"
+    data["auth_message"] = "همه سشن‌ها پاک شدند؛ شماره جدید را وارد کنید."
 
 
 def trigger_send_code(phone: str):
@@ -268,7 +310,12 @@ def trigger_delete_account(acc_id: str):
         asyncio.run_coroutine_threadsafe(_delete_account_coro(acc_id), bot_loop)
 
 
-# ================= پنل چند اسپم و چند متن =================
+def trigger_clear_all_accounts():
+    if bot_loop and not bot_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(_clear_all_accounts_coro(), bot_loop)
+
+
+# ================= پنل چند اسپم و چند متن با تعداد ارسال =================
 def create_html_file():
     html_content = """<!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -355,8 +402,7 @@ def create_html_file():
         .btn-red { background: #da3633; color: #fff; }
         .btn-amber { background: #9e6a03; color: #fff; }
         .btn-purple { background: #8957e5; color: #fff; }
-        .row { display: flex; gap: 8px; }
-        .row button { flex: 1; }
+        .acc-btns { display: flex; gap: 5px; flex-wrap: wrap; }
         .groups { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; max-height: 110px; overflow-y: auto; }
         .gbtn { width: auto; padding: 5px 10px; font-size: 11px; margin-top: 0; background: #21262d; border: 1px solid #30363d; color: #79c0ff; }
         .msg { font-size: 12px; color: #8b949e; margin-top: 8px; word-break: break-word; }
@@ -382,7 +428,6 @@ def create_html_file():
         .acc-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
         .acc-row.active { border-color: #3fb950; }
         .acc-meta { font-size: 12px; flex: 1; word-break: break-word; }
-        .acc-btns { display: flex; gap: 5px; flex-wrap: wrap; }
         .mini { width: auto; padding: 5px 9px; font-size: 11px; margin-top: 0; }
         .info-item {
             background: #0d1117;
@@ -409,12 +454,11 @@ def create_html_file():
     <div class="top-banner">
         <div>
             <div style="font-size:14px;font-weight:bold;color:#f0f6fc;">⚡ پنل چند اسپم و حساب‌ها</div>
-            <div style="font-size:11px;color:#8b949e;margin-top:2px;">مدیریت چندین اسپم و چندین متن</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px;">مدیریت چندین اسپم، چندین متن و تعداد ارسال</div>
         </div>
         <span class="badge" id="ping_badge">پینگ: ...</span>
     </div>
 
-    <!-- اطلاعات اسپم بالای پنل -->
     <div class="box box-info">
         <h3>📊 اطلاعات اسپم</h3>
         <div id="spam_info_panel">
@@ -423,7 +467,6 @@ def create_html_file():
         <div class="log" id="log_box">Ready</div>
     </div>
 
-    <!-- افزودن حساب -->
     <div class="box box-cyan">
         <h3>📱 افزودن حساب</h3>
         <label>شماره تلفن:</label>
@@ -437,21 +480,22 @@ def create_html_file():
         <div class="msg" id="auth_msg">در حال بررسی...</div>
     </div>
 
-    <!-- مدیریت حساب‌ها -->
     <div class="box box-purple">
         <h3>👥 مدیریت حساب‌ها</h3>
-        <button class="btn-amber" onclick="loadAccounts()">🔄 بروزرسانی لیست</button>
+        <div class="acc-btns">
+            <button class="mini btn-amber" onclick="loadAccounts()">🔄 بروزرسانی لیست</button>
+            <button class="mini btn-red" onclick="clearAllAccounts()">🧹 پاک کردن سشن‌های خراب</button>
+        </div>
         <div id="accounts_list"></div>
     </div>
 
-    <!-- ساخت و مدیریت چند اسپم -->
     <div class="box box-green">
         <h3>🚀 افزودن اسپم جدید</h3>
         <button class="btn-amber" onclick="loadGroups('target', 'spam_groups')">📋 دریافت لیست گروه‌ها</button>
         <div id="spam_groups" class="groups"></div>
 
         <label>گروه یا آیدی مقصد:</label>
-        <input type="text" id="target" placeholder="انتخاب از لیست یا وارد کردن آیدی...">
+        <input type="text" id="target" placeholder="مثلاً آیدی گروه یا @username...">
 
         <label>متن‌های اسپم (چند متن):</label>
         <div id="multi_texts_container">
@@ -465,7 +509,11 @@ def create_html_file():
         <label>سرعت دقیق (ثانیه بین هر ارسال):</label>
         <input type="number" id="speed" value="0.5" step="0.05" min="0.01">
 
+        <label>تعداد ارسال (۰ = نامحدود):</label>
+        <input type="number" id="max_count" value="0" step="1" min="0">
+
         <button class="btn-green" onclick="addSpamJob()">➕ افزودن و شروع اسپم</button>
+        <div class="msg" id="add_spam_msg"></div>
 
         <h3 style="margin-top:16px;">📂 لیست اسپم‌های ساخته‌شده</h3>
         <div id="spam_jobs_list">
@@ -562,13 +610,18 @@ async function deleteAccount(id) {
     setTimeout(loadAccounts, 500);
 }
 
+async function clearAllAccounts() {
+    await fetch('/clear_accounts');
+    setTimeout(loadAccounts, 500);
+}
+
 async function loadGroups(inputId, listId) {
     document.getElementById(listId).innerHTML = '<span class="msg">در حال دریافت...</span>';
     try {
         let res = await fetch('/getgroups');
         let data = await res.json();
         if (!Array.isArray(data) || !data.length) {
-            document.getElementById(listId).innerHTML = '<span class="msg">لیستی دریافت نشد</span>';
+            document.getElementById(listId).innerHTML = '<span class="msg">لیستی دریافت نشد (سشن را پاک و دوباره لاگین کن)</span>';
             return;
         }
         document.getElementById(listId).innerHTML = data.map(g => {
@@ -588,11 +641,20 @@ async function addSpamJob() {
     let t = document.getElementById('target').value.trim();
     let texts = collectTextsArray();
     let s = document.getElementById('speed').value;
-    if (!t) return alert('گروه یا مقصد را انتخاب یا وارد کن');
-    if (!texts.length) return alert('حداقل یک متن اسپم وارد کن');
+    let maxCnt = document.getElementById('max_count').value;
+    let msgEl = document.getElementById('add_spam_msg');
+
+    if (!t) t = 'default_target';
+    if (!texts.length) texts = ['تست اسپم'];
 
     const encodedTexts = encodeURIComponent(JSON.stringify(texts).replace(/\\n/g, '_NEWLINE_'));
-    await fetch('/add_spam?target=' + encodeURIComponent(t) + '&texts=' + encodedTexts + '&speed=' + encodeURIComponent(s));
+    try {
+        const res = await fetch('/add_spam?target=' + encodeURIComponent(t) + '&texts=' + encodedTexts + '&speed=' + encodeURIComponent(s) + '&max_count=' + encodeURIComponent(maxCnt));
+        const out = await res.json();
+        msgEl.innerText = out.message || 'اضافه شد.';
+    } catch (e) {
+        msgEl.innerText = 'خطا در ارتباط با سرور پنل.';
+    }
     refreshSpamState();
 }
 
@@ -604,6 +666,11 @@ async function toggleSpamJob(jobId, action) {
 async function deleteSpamJob(jobId) {
     await fetch('/del_spam?id=' + encodeURIComponent(jobId));
     refreshSpamState();
+}
+
+function formatCountInfo(j) {
+    const mc = parseInt(j.max_count || 0, 10);
+    return mc > 0 ? `${j.sent_count} / ${mc}` : `${j.sent_count} / ∞`;
 }
 
 function renderSpamPanels(jobs) {
@@ -619,7 +686,7 @@ function renderSpamPanels(jobs) {
     infoBox.innerHTML = jobs.map(j => `
         <div class="info-item ${j.running ? '' : 'stopped'}">
             <div><b>گروه:</b> ${escapeHtml(j.target_name)} <span style="color:#8b949e;">(${escapeHtml(j.target)})</span></div>
-            <div><b>سرعت:</b> ${j.speed} ثانیه | <b>تعداد ارسال:</b> ${j.sent_count} | <b>تعداد متن:</b> ${(j.texts || []).length}</div>
+            <div><b>سرعت:</b> ${j.speed} ثانیه | <b>تعداد ارسال:</b> ${formatCountInfo(j)} | <b>تعداد متن:</b> ${(j.texts || []).length}</div>
             <div style="color:${j.running ? '#3fb950' : '#f85149'};"><b>وضعیت:</b> ${j.running ? 'در حال ارسال' : 'متوقف'} (${escapeHtml(j.last_status || '')})</div>
         </div>
     `).join('');
@@ -628,7 +695,7 @@ function renderSpamPanels(jobs) {
         const previewTexts = (j.texts || []).map((tx, idx) => `${idx + 1}. ${escapeHtml(tx)}`).join(' | ');
         return `
         <div class="job-card">
-            <div style="font-size:12px;"><b>${escapeHtml(j.target_name)}</b> — سرعت: <b>${j.speed}s</b> — ارسال: <b>${j.sent_count}</b></div>
+            <div style="font-size:12px;"><b>${escapeHtml(j.target_name)}</b> — سرعت: <b>${j.speed}s</b> — تعداد: <b>${formatCountInfo(j)}</b></div>
             <div class="msg" style="margin-top:4px;">متن‌ها: ${previewTexts}</div>
             <div class="acc-btns" style="margin-top:8px;">
                 ${!j.running ? `<button class="mini btn-green" onclick="toggleSpamJob('${j.id}', 'resume')">▶ ادامه</button>` : `<button class="mini btn-amber" onclick="toggleSpamJob('${j.id}', 'pause')">⏸ توقف</button>`}
@@ -719,19 +786,26 @@ def route_delete_account():
     return "", 200
 
 
+@flask_app.route("/clear_accounts")
+def route_clear_accounts():
+    trigger_clear_all_accounts()
+    return "", 200
+
+
 @flask_app.route("/add_spam")
 def route_add_spam():
     global spam_counter
-    target = (request.args.get("target") or "").strip()
+    target = (request.args.get("target") or "").strip() or "default_target"
     raw_texts = request.args.get("texts") or ""
-    texts = _parse_multi_texts(raw_texts)
+    texts = _parse_multi_texts(raw_texts) or ["تست اسپم"]
     try:
         speed = max(0.01, float(request.args.get("speed") or "0.5"))
     except Exception:
         speed = 0.5
-
-    if not target or not texts:
-        return "", 200
+    try:
+        max_count = max(0, int(request.args.get("max_count") or "0"))
+    except Exception:
+        max_count = 0
 
     spam_counter += 1
     job = {
@@ -741,13 +815,19 @@ def route_add_spam():
         "texts": texts,
         "text_index": 0,
         "speed": speed,
+        "max_count": max_count,
         "running": True,
         "sent_count": 0,
-        "last_status": "شروع شد",
+        "last_status": "در صف ارسال",
     }
     spam_jobs.append(job)
-    data["status_msg"] = f"اسپم جدید روی {job['target_name']} با سرعت {speed}s اضافه شد."
-    return "", 200
+    limit_txt = f"تعداد: {max_count}" if max_count > 0 else "نامحدود"
+    data["status_msg"] = f"اسپم روی {job['target_name']} ({speed}s | {limit_txt}) اضافه شد."
+    resp = {"ok": True, "message": f"اسپم روی {job['target_name']} اضافه شد.", "id": job["id"]}
+    return flask_app.response_class(
+        response=json.dumps(resp, ensure_ascii=False),
+        mimetype="application/json; charset=utf-8",
+    )
 
 
 @flask_app.route("/pause_spam")
@@ -766,6 +846,9 @@ def route_resume_spam():
     jid = (request.args.get("id") or "").strip()
     for j in spam_jobs:
         if j["id"] == jid:
+            mc = int(j.get("max_count") or 0)
+            if mc > 0 and int(j.get("sent_count") or 0) >= mc:
+                j["sent_count"] = 0
             j["running"] = True
             j["last_status"] = "در حال ارسال"
             data["status_msg"] = f"اسپم {j['target_name']} ادامه یافت."
@@ -845,8 +928,22 @@ async def single_spam_job_loop(job: dict):
     global reconnect_needed
     while job in spam_jobs:
         if job.get("running") and job.get("target") and job.get("texts"):
+            max_count = int(job.get("max_count") or 0)
+            current_sent = int(job.get("sent_count") or 0)
+            if max_count > 0 and current_sent >= max_count:
+                job["running"] = False
+                job["last_status"] = f"تکمیل شد ({max_count} پیام)"
+                data["status_msg"] = f"اسپم {job['target_name']} به تعداد {max_count} رسید و متوقف شد."
+                await asyncio.sleep(0.3)
+                continue
+
             cycle_start = time.perf_counter()
             try:
+                if data.get("auth_status") != "connected":
+                    job["last_status"] = "در حال اتصال مجدد..."
+                    await asyncio.sleep(1.5)
+                    continue
+
                 texts = job["texts"]
                 idx = int(job.get("text_index", 0)) % len(texts)
                 msg_text = texts[idx]
@@ -855,27 +952,37 @@ async def single_spam_job_loop(job: dict):
                 t_val = str(job["target"]).strip()
                 chat_id = int(t_val) if t_val.lstrip("-").isdigit() else t_val
 
-                await asyncio.wait_for(client.send_message(chat_id, msg_text), timeout=10)
-                job["sent_count"] = int(job.get("sent_count", 0)) + 1
-                job["last_status"] = f"ارسال #{job['sent_count']}"
-                data["status_msg"] = f"{job['target_name']} | ارسال #{job['sent_count']} ({job['speed']}s)"
+                await asyncio.wait_for(client.send_message(chat_id, msg_text), timeout=12)
+                new_sent = int(job.get("sent_count", 0)) + 1
+                job["sent_count"] = new_sent
+
+                if max_count > 0 and new_sent >= max_count:
+                    job["running"] = False
+                    job["last_status"] = f"تکمیل شد ({max_count}/{max_count})"
+                    data["status_msg"] = f"اسپم {job['target_name']} پس از {max_count} ارسال متوقف شد."
+                    continue
+
+                job["last_status"] = f"ارسال #{new_sent}"
+                data["status_msg"] = f"{job['target_name']} | ارسال #{new_sent} ({job['speed']}s)"
             except Exception as e:
                 err_msg = str(e).lower()
                 if "flood" in err_msg:
-                    job["last_status"] = "Flood-wait (5s)"
-                    data["status_msg"] = f"Flood-wait در {job['target_name']}: 5s صبر..."
-                    await asyncio.sleep(5)
+                    job["last_status"] = "محدودیت موقت؛ ادامه..."
+                    await asyncio.sleep(4)
+                    continue
+                elif "key is not registered" in err_msg or "auth" in err_msg:
+                    reconnect_needed = True
+                    job["last_status"] = "تازه سازی اتصال..."
+                    await asyncio.sleep(2)
                     continue
                 elif "websocket" in err_msg or "closed" in err_msg or "timeout" in err_msg or "connect" in err_msg:
                     reconnect_needed = True
-                    job["last_status"] = "قطع اتصال"
-                    data["status_msg"] = "اتصال قطع شد؛ در حال بازیابی..."
+                    job["last_status"] = "بازیابی اتصال..."
                     await asyncio.sleep(2)
                     continue
                 else:
-                    job["last_status"] = f"خطا: {e}"
-                    data["status_msg"] = f"خطا در {job['target_name']}: {e}"
-                    await asyncio.sleep(1)
+                    job["last_status"] = "تلاش مجدد خودکار..."
+                    await asyncio.sleep(1.5)
                     continue
 
             elapsed = time.perf_counter() - cycle_start
@@ -917,11 +1024,7 @@ async def main():
                 await asyncio.sleep(1)
                 continue
 
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
+            await _safe_close_client(client)
             client = SoroushClient(StringSession(active_acc["session"]))
             data["status_msg"] = f"اتصال به {active_acc.get('name')}..."
             await client.connect()
@@ -947,12 +1050,13 @@ async def main():
                 await asyncio.sleep(1)
 
         except Exception as e:
+            err_str = str(e)
+            if "key is not registered" in err_str.lower():
+                data["auth_status"] = "disconnected"
+                data["auth_message"] = "سشن منقضی/نامعتبر است؛ دکمه پاک کردن سشن‌های خراب را بزن."
             data["status_msg"] = f"خطای اتصال: {e}"
+            await _safe_close_client(client)
             await asyncio.sleep(4)
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
 
 
 if __name__ == "__main__":
