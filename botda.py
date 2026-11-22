@@ -2,8 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
+from datetime import datetime
 from threading import Thread
+from urllib.parse import urlparse
 
 from flask import Flask, request
 from splusthon import SoroushClient
@@ -11,28 +14,20 @@ from splusthon.sessions import StringSession
 
 # ================= تنظیمات =================
 ACCOUNTS_FILE = "accounts_data.json"
+SPAM_JOBS_FILE = "spam_jobs_data.json"
 LEGACY_SESSION_FILE = "session_local.txt"
 PORT = int(os.environ.get("PORT", 8080))
 HTML_FILE = "panel.html"
+
+PANEL_PATH = os.environ.get("PANEL_PATH", "/my-panel")
+if not PANEL_PATH.startswith("/"):
+    PANEL_PATH = "/" + PANEL_PATH
 
 accounts_store = {
     "active_id": None,
     "accounts": [],
 }
 
-# هر آیتم در spam_jobs:
-# {
-#   "id": "sp_1",
-#   "target": "...",
-#   "target_name": "...",
-#   "texts": ["متن 1", "متن 2"],
-#   "text_index": 0,
-#   "speed": 0.5,
-#   "max_count": 0,      # 0 = نامحدود
-#   "running": True,
-#   "sent_count": 0,
-#   "last_status": "در صف ارسال"
-# }
 spam_jobs = []
 spam_counter = 0
 
@@ -50,6 +45,11 @@ bot_loop = None
 pending_phone = ""
 switch_requested = False
 reconnect_needed = False
+is_connected_flag = False
+
+
+def _now_str() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def load_accounts():
@@ -86,6 +86,27 @@ def save_accounts():
         print(f"[ERR save_accounts] {e}")
 
 
+def load_spam_jobs():
+    global spam_jobs, spam_counter
+    if os.path.exists(SPAM_JOBS_FILE):
+        try:
+            with open(SPAM_JOBS_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, list):
+                    spam_jobs = loaded
+                    spam_counter = len(spam_jobs)
+        except Exception as e:
+            print(f"[ERR load_spam_jobs] {e}")
+
+
+def save_spam_jobs():
+    try:
+        with open(SPAM_JOBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(spam_jobs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[ERR save_spam_jobs] {e}")
+
+
 def get_active_account():
     aid = accounts_store.get("active_id")
     for acc in accounts_store.get("accounts", []):
@@ -106,10 +127,40 @@ def get_public_accounts_list():
     ]
 
 
+def parse_any_target(raw_input: str) -> str:
+    s = str(raw_input or "").strip()
+    if not s:
+        return ""
+
+    if s.startswith("http://") or s.startswith("https://") or "splus.ir" in s:
+        url_str = s if s.startswith("http") else "https://" + s
+        try:
+            parsed = urlparse(url_str)
+            parts = [p for p in parsed.path.split("/") if p]
+            if parts:
+                if len(parts) >= 2 and parts[-1].isdigit():
+                    if parts[0] == "c" and len(parts) >= 2 and parts[1].lstrip("-").isdigit():
+                        cid = parts[1]
+                        return f"-100{cid}" if not cid.startswith("-") else cid
+                    return parts[-2]
+                return parts[0]
+        except Exception:
+            pass
+
+    m = re.search(r"(?:https?://)?(?:www\.)?splus\.ir/([^/\s?#]+)", s)
+    if m:
+        return m.group(1).strip()
+
+    if s.startswith("@"):
+        return s[1:].strip()
+
+    return s
+
+
 def _resolve_group_name(target: str) -> str:
     t_str = str(target).strip()
     for g in group_list:
-        if str(g.get("id")) == t_str:
+        if str(g.get("id")) == t_str or str(g.get("name")) == t_str:
             return g.get("name") or t_str
     return t_str
 
@@ -133,6 +184,7 @@ def _parse_multi_texts(raw_texts_encoded: str) -> list:
 
 
 load_accounts()
+load_spam_jobs()
 
 
 # ================= بستن تمیز کلاینت و نشست‌ها =================
@@ -239,7 +291,7 @@ async def _submit_code_coro(code: str):
 
 
 async def _switch_account_coro(acc_id: str):
-    global client, switch_requested, group_list
+    global client, switch_requested, group_list, is_connected_flag
     target_acc = next((a for a in accounts_store["accounts"] if a["id"] == acc_id), None)
     if not target_acc:
         data["auth_message"] = "حساب پیدا نشد."
@@ -248,6 +300,7 @@ async def _switch_account_coro(acc_id: str):
     accounts_store["active_id"] = acc_id
     save_accounts()
     group_list = []
+    is_connected_flag = False
 
     await _safe_close_client(client)
     client = SoroushClient(StringSession(target_acc.get("session", "")))
@@ -257,13 +310,14 @@ async def _switch_account_coro(acc_id: str):
 
 
 async def _delete_account_coro(acc_id: str):
-    global client, switch_requested, group_list
+    global client, switch_requested, group_list, is_connected_flag
     accounts_store["accounts"] = [a for a in accounts_store["accounts"] if a["id"] != acc_id]
     if accounts_store.get("active_id") == acc_id:
         accounts_store["active_id"] = (
             accounts_store["accounts"][0]["id"] if accounts_store["accounts"] else None
         )
         group_list = []
+        is_connected_flag = False
         await _safe_close_client(client)
         next_acc = get_active_account()
         client = SoroushClient(StringSession(next_acc.get("session", "") if next_acc else ""))
@@ -274,7 +328,7 @@ async def _delete_account_coro(acc_id: str):
 
 
 async def _clear_all_accounts_coro():
-    global client, switch_requested, group_list, accounts_store
+    global client, switch_requested, group_list, accounts_store, is_connected_flag
     accounts_store = {"active_id": None, "accounts": []}
     save_accounts()
     if os.path.exists(LEGACY_SESSION_FILE):
@@ -283,6 +337,7 @@ async def _clear_all_accounts_coro():
         except Exception:
             pass
     group_list = []
+    is_connected_flag = False
     await _safe_close_client(client)
     client = SoroushClient(StringSession())
     switch_requested = True
@@ -315,14 +370,14 @@ def trigger_clear_all_accounts():
         asyncio.run_coroutine_threadsafe(_clear_all_accounts_coro(), bot_loop)
 
 
-# ================= پنل چند اسپم و چند متن با تعداد ارسال =================
+# ================= پنل کنترل کامل =================
 def create_html_file():
     html_content = """<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>پنل چند اسپم سلف</title>
+    <title>داشبورد کنترل</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -417,6 +472,7 @@ def create_html_file():
             margin-top: 8px;
             direction: ltr;
             text-align: left;
+            word-break: break-word;
         }
         .acc-row, .job-card {
             border: 1px solid #30363d;
@@ -453,8 +509,8 @@ def create_html_file():
 <div class="wrap">
     <div class="top-banner">
         <div>
-            <div style="font-size:14px;font-weight:bold;color:#f0f6fc;">⚡ پنل چند اسپم و حساب‌ها</div>
-            <div style="font-size:11px;color:#8b949e;margin-top:2px;">مدیریت چندین اسپم، چندین متن و تعداد ارسال</div>
+            <div style="font-size:14px;font-weight:bold;color:#f0f6fc;">⚡ داشبورد کنترل</div>
+            <div style="font-size:11px;color:#8b949e;margin-top:2px;">لینک چنل، لینک پیام، آیدی، چند متن و سرعت</div>
         </div>
         <span class="badge" id="ping_badge">پینگ: ...</span>
     </div>
@@ -484,7 +540,7 @@ def create_html_file():
         <h3>👥 مدیریت حساب‌ها</h3>
         <div class="acc-btns">
             <button class="mini btn-amber" onclick="loadAccounts()">🔄 بروزرسانی لیست</button>
-            <button class="mini btn-red" onclick="clearAllAccounts()">🧹 پاک کردن سشن‌های خراب</button>
+            <button class="mini btn-red" onclick="clearAllAccounts()">🧹 پاک کردن سشن‌ها</button>
         </div>
         <div id="accounts_list"></div>
     </div>
@@ -494,8 +550,8 @@ def create_html_file():
         <button class="btn-amber" onclick="loadGroups('target', 'spam_groups')">📋 دریافت لیست گروه‌ها</button>
         <div id="spam_groups" class="groups"></div>
 
-        <label>گروه یا آیدی مقصد:</label>
-        <input type="text" id="target" placeholder="مثلاً آیدی گروه یا @username...">
+        <label>مقصد (لینک چنل، لینک پیام، @یوزرنیم یا آیدی):</label>
+        <input type="text" id="target" placeholder="مثلاً https://splus.ir/channel/123 یا @id یا آیدی...">
 
         <label>متن‌های اسپم (چند متن):</label>
         <div id="multi_texts_container">
@@ -621,7 +677,7 @@ async function loadGroups(inputId, listId) {
         let res = await fetch('/getgroups');
         let data = await res.json();
         if (!Array.isArray(data) || !data.length) {
-            document.getElementById(listId).innerHTML = '<span class="msg">لیستی دریافت نشد (سشن را پاک و دوباره لاگین کن)</span>';
+            document.getElementById(listId).innerHTML = '<span class="msg">لیستی دریافت نشد</span>';
             return;
         }
         document.getElementById(listId).innerHTML = data.map(g => {
@@ -685,9 +741,10 @@ function renderSpamPanels(jobs) {
 
     infoBox.innerHTML = jobs.map(j => `
         <div class="info-item ${j.running ? '' : 'stopped'}">
-            <div><b>گروه:</b> ${escapeHtml(j.target_name)} <span style="color:#8b949e;">(${escapeHtml(j.target)})</span></div>
-            <div><b>سرعت:</b> ${j.speed} ثانیه | <b>تعداد ارسال:</b> ${formatCountInfo(j)} | <b>تعداد متن:</b> ${(j.texts || []).length}</div>
+            <div><b>مقصد:</b> ${escapeHtml(j.target_name)} <span style="color:#8b949e;">(${escapeHtml(j.target)})</span></div>
+            <div><b>سرعت:</b> ${j.speed} ثانیه | <b>تعداد ارسال:</b> ${formatCountInfo(j)} | <b>آخرین ارسال:</b> ${escapeHtml(j.last_sent_time || '-')}</div>
             <div style="color:${j.running ? '#3fb950' : '#f85149'};"><b>وضعیت:</b> ${j.running ? 'در حال ارسال' : 'متوقف'} (${escapeHtml(j.last_status || '')})</div>
+            ${j.last_error ? `<div style="color:#ffa657;font-size:11px;" dir="ltr">err: ${escapeHtml(j.last_error)}</div>` : ''}
         </div>
     `).join('');
 
@@ -735,10 +792,19 @@ logging.getLogger("werkzeug").setLevel(logging.ERROR)
 flask_app = Flask(__name__)
 
 
-@flask_app.route("/")
-def index():
+def _render_panel():
     with open(HTML_FILE, "r", encoding="utf-8") as f:
         return f.read()
+
+
+@flask_app.route(PANEL_PATH)
+def custom_panel():
+    return _render_panel()
+
+
+@flask_app.route("/")
+def index():
+    return f"Service is running. Open panel at {PANEL_PATH}", 200
 
 
 @flask_app.route("/health")
@@ -795,7 +861,8 @@ def route_clear_accounts():
 @flask_app.route("/add_spam")
 def route_add_spam():
     global spam_counter
-    target = (request.args.get("target") or "").strip() or "default_target"
+    raw_target = (request.args.get("target") or "").strip()
+    parsed_target = parse_any_target(raw_target) or "default_target"
     raw_texts = request.args.get("texts") or ""
     texts = _parse_multi_texts(raw_texts) or ["تست اسپم"]
     try:
@@ -810,17 +877,20 @@ def route_add_spam():
     spam_counter += 1
     job = {
         "id": f"sp_{spam_counter}_{int(time.time() * 1000) % 10000}",
-        "target": target,
-        "target_name": _resolve_group_name(target),
+        "target": parsed_target,
+        "target_name": _resolve_group_name(parsed_target),
         "texts": texts,
         "text_index": 0,
         "speed": speed,
         "max_count": max_count,
         "running": True,
         "sent_count": 0,
+        "last_sent_time": "-",
+        "last_error": "",
         "last_status": "در صف ارسال",
     }
     spam_jobs.append(job)
+    save_spam_jobs()
     limit_txt = f"تعداد: {max_count}" if max_count > 0 else "نامحدود"
     data["status_msg"] = f"اسپم روی {job['target_name']} ({speed}s | {limit_txt}) اضافه شد."
     resp = {"ok": True, "message": f"اسپم روی {job['target_name']} اضافه شد.", "id": job["id"]}
@@ -838,6 +908,7 @@ def route_pause_spam():
             j["running"] = False
             j["last_status"] = "متوقف شد"
             data["status_msg"] = f"اسپم {j['target_name']} متوقف شد."
+    save_spam_jobs()
     return "", 200
 
 
@@ -850,8 +921,10 @@ def route_resume_spam():
             if mc > 0 and int(j.get("sent_count") or 0) >= mc:
                 j["sent_count"] = 0
             j["running"] = True
+            j["last_error"] = ""
             j["last_status"] = "در حال ارسال"
             data["status_msg"] = f"اسپم {j['target_name']} ادامه یافت."
+    save_spam_jobs()
     return "", 200
 
 
@@ -859,6 +932,7 @@ def route_resume_spam():
 def route_del_spam():
     jid = (request.args.get("id") or "").strip()
     spam_jobs[:] = [j for j in spam_jobs if j["id"] != jid]
+    save_spam_jobs()
     data["status_msg"] = "یک اسپم حذف شد."
     return "", 200
 
@@ -910,22 +984,26 @@ async def ping_loop():
     global reconnect_needed
     fail_streak = 0
     while True:
-        try:
-            t0 = time.perf_counter()
-            await asyncio.wait_for(client.get_me(), timeout=5)
-            ms = int((time.perf_counter() - t0) * 1000)
-            data["ping"] = f"{ms} ms"
-            fail_streak = 0
-        except Exception:
-            fail_streak += 1
+        if is_connected_flag and data.get("auth_status") == "connected":
+            try:
+                t0 = time.perf_counter()
+                await asyncio.wait_for(client.get_me(), timeout=6)
+                ms = int((time.perf_counter() - t0) * 1000)
+                data["ping"] = f"{ms} ms"
+                fail_streak = 0
+            except Exception:
+                fail_streak += 1
+                data["ping"] = "قطع"
+                if fail_streak >= 2:
+                    reconnect_needed = True
+        else:
             data["ping"] = "قطع"
-            if fail_streak >= 2:
-                reconnect_needed = True
         await asyncio.sleep(6)
 
 
 async def single_spam_job_loop(job: dict):
     global reconnect_needed
+    consec_errors = 0
     while job in spam_jobs:
         if job.get("running") and job.get("target") and job.get("texts"):
             max_count = int(job.get("max_count") or 0)
@@ -933,14 +1011,15 @@ async def single_spam_job_loop(job: dict):
             if max_count > 0 and current_sent >= max_count:
                 job["running"] = False
                 job["last_status"] = f"تکمیل شد ({max_count} پیام)"
+                save_spam_jobs()
                 data["status_msg"] = f"اسپم {job['target_name']} به تعداد {max_count} رسید و متوقف شد."
                 await asyncio.sleep(0.3)
                 continue
 
             cycle_start = time.perf_counter()
             try:
-                if data.get("auth_status") != "connected":
-                    job["last_status"] = "در حال اتصال مجدد..."
+                if not is_connected_flag or data.get("auth_status") != "connected":
+                    job["last_status"] = "منتظر اتصال کلاینت..."
                     await asyncio.sleep(1.5)
                     continue
 
@@ -949,39 +1028,47 @@ async def single_spam_job_loop(job: dict):
                 msg_text = texts[idx]
                 job["text_index"] = (idx + 1) % len(texts)
 
-                t_val = str(job["target"]).strip()
+                t_val = parse_any_target(str(job["target"]).strip())
                 chat_id = int(t_val) if t_val.lstrip("-").isdigit() else t_val
 
                 await asyncio.wait_for(client.send_message(chat_id, msg_text), timeout=12)
                 new_sent = int(job.get("sent_count", 0)) + 1
                 job["sent_count"] = new_sent
+                job["last_sent_time"] = _now_str()
+                job["last_error"] = ""
+                consec_errors = 0
+
+                if new_sent % 10 == 0:
+                    save_spam_jobs()
 
                 if max_count > 0 and new_sent >= max_count:
                     job["running"] = False
                     job["last_status"] = f"تکمیل شد ({max_count}/{max_count})"
+                    save_spam_jobs()
                     data["status_msg"] = f"اسپم {job['target_name']} پس از {max_count} ارسال متوقف شد."
                     continue
 
                 job["last_status"] = f"ارسال #{new_sent}"
                 data["status_msg"] = f"{job['target_name']} | ارسال #{new_sent} ({job['speed']}s)"
             except Exception as e:
-                err_msg = str(e).lower()
+                consec_errors += 1
+                err_str = str(e)
+                err_msg = err_str.lower()
+                job["last_error"] = err_str[:120]
+
                 if "flood" in err_msg:
-                    job["last_status"] = "محدودیت موقت؛ ادامه..."
-                    await asyncio.sleep(4)
-                    continue
-                elif "key is not registered" in err_msg or "auth" in err_msg:
-                    reconnect_needed = True
-                    job["last_status"] = "تازه سازی اتصال..."
-                    await asyncio.sleep(2)
+                    job["last_status"] = "محدودیت موقت (Flood)؛ صبر..."
+                    await asyncio.sleep(5)
                     continue
                 elif "websocket" in err_msg or "closed" in err_msg or "timeout" in err_msg or "connect" in err_msg:
                     reconnect_needed = True
-                    job["last_status"] = "بازیابی اتصال..."
+                    job["last_status"] = "قطع اتصال؛ بازیابی..."
                     await asyncio.sleep(2)
                     continue
                 else:
-                    job["last_status"] = "تلاش مجدد خودکار..."
+                    job["last_status"] = f"خطای ارسال (#{consec_errors})"
+                    if consec_errors >= 5:
+                        reconnect_needed = True
                     await asyncio.sleep(1.5)
                     continue
 
@@ -1008,7 +1095,7 @@ async def spam_dispatcher_loop():
 
 
 async def main():
-    global bot_loop, client, switch_requested, reconnect_needed
+    global bot_loop, client, switch_requested, reconnect_needed, is_connected_flag
     bot_loop = asyncio.get_running_loop()
 
     asyncio.create_task(spam_dispatcher_loop())
@@ -1018,6 +1105,8 @@ async def main():
         try:
             switch_requested = False
             reconnect_needed = False
+            is_connected_flag = False
+
             active_acc = get_active_account()
             if not active_acc or not active_acc.get("session"):
                 data["status_msg"] = "منتظر افزودن یا انتخاب حساب..."
@@ -1027,20 +1116,21 @@ async def main():
             await _safe_close_client(client)
             client = SoroushClient(StringSession(active_acc["session"]))
             data["status_msg"] = f"اتصال به {active_acc.get('name')}..."
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=15)
 
             if hasattr(client, "is_user_authorized"):
-                if not await client.is_user_authorized():
+                if not await asyncio.wait_for(client.is_user_authorized(), timeout=10):
                     data["auth_status"] = "disconnected"
                     data["auth_message"] = "سشن نامعتبر است؛ حساب را دوباره اضافه کنید."
                     await asyncio.sleep(2)
                     continue
 
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), timeout=10)
             if getattr(me, "first_name", None):
                 active_acc["name"] = me.first_name
                 save_accounts()
 
+            is_connected_flag = True
             data["auth_status"] = "connected"
             data["auth_message"] = f"متصل به: {active_acc.get('name')}"
             data["status_msg"] = f"{active_acc.get('name')} آنلاین شد."
@@ -1050,13 +1140,14 @@ async def main():
                 await asyncio.sleep(1)
 
         except Exception as e:
+            is_connected_flag = False
             err_str = str(e)
             if "key is not registered" in err_str.lower():
                 data["auth_status"] = "disconnected"
-                data["auth_message"] = "سشن منقضی/نامعتبر است؛ دکمه پاک کردن سشن‌های خراب را بزن."
+                data["auth_message"] = "سشن منقضی/نامعتبر است؛ دکمه پاک کردن سشن‌ها را بزن."
             data["status_msg"] = f"خطای اتصال: {e}"
             await _safe_close_client(client)
-            await asyncio.sleep(4)
+            await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
